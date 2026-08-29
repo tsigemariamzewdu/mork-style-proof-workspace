@@ -58,6 +58,13 @@ def main() -> None:
         type=Path,
         help="Workspace directory for the proof artifacts; defaults to proofs/<theorem-slug>",
     )
+    parser.add_argument(
+        "--lake-project",
+        type=Path,
+        default=None,
+        help="Path to a Lake project with Mathlib set up; when given, Lean checks "
+             "run via `lake env lean` inside it instead of a bare `lean` invocation",
+    )
     args = parser.parse_args()
 
     slug = re.sub(r"[^a-z0-9]+", "-", args.theorem.lower()).strip("-")[:48] or "proof-demo"
@@ -66,7 +73,7 @@ def main() -> None:
         shutil.rmtree(demo_dir)
     demo_dir.mkdir(parents=True)
 
-    from proof_proto.langgraph_workflow import make_llm_client
+    from proof_proto.langgraph_workflow import make_llm_client,LeanChecker
     llm = make_llm_client(
         provider=args.provider,
         model=args.model,
@@ -75,8 +82,20 @@ def main() -> None:
     print(f"theorem: {args.theorem}")
     print(f"llm client: {type(llm).__name__}\n")
 
-    result = run_workflow(theorem=args.theorem, root=str(demo_dir),
-                          llm_client=llm, max_iterations=args.iterations)
+    lean_checker = None
+    if args.lake_project:
+        lean_checker = LeanChecker(
+        use_lake=True,
+        lake_project_dir=str(args.lake_project.resolve()),
+        timeout_seconds=120,  # Mathlib-backed checks are much slower than bare lean
+    )
+        print(f"lean checker: lake env lean (project: {args.lake_project})\n")
+    
+    result = run_workflow(
+        theorem=args.theorem, root=str(demo_dir),
+        llm_client=llm, max_iterations=args.iterations,
+        lean_checker=lean_checker,
+    )
     project: ProofProject = result["project"]
 
     show_journal(project)

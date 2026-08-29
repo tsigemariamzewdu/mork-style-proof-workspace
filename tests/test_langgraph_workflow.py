@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -6,6 +7,37 @@ import unittest
 from pathlib import Path
 
 from proof_proto.langgraph_workflow import run_workflow
+
+
+def _write_fake_lean(directory: str, *, stdout: str = "", stderr: str = "", exit_code: int = 0) -> Path:
+    """Write a minimal fake `lean` executable for whichever OS the tests are
+    running on, so LeanChecker's subprocess.run([binary, file]) call succeeds
+    without an actual Lean toolchain installed. Windows can't execute a
+    `#!/bin/sh` script directly, so this writes a .bat file there instead of
+    a POSIX shell script.
+    """
+    if os.name == "nt":
+        path = Path(directory, "lean.bat")
+        lines = ["@echo off"]
+        if stdout:
+            lines.append(f"echo {stdout}")
+        if stderr:
+            lines.append(f"echo {stderr} 1>&2")
+        lines.append(f"exit /b {exit_code}")
+        path.write_text("\r\n".join(lines) + "\r\n")
+    else:
+        import stat
+
+        path = Path(directory, "lean")
+        lines = ["#!/bin/sh"]
+        if stdout:
+            lines.append(f'echo "{stdout}"')
+        if stderr:
+            lines.append(f'echo "{stderr}" >&2')
+        lines.append(f"exit {exit_code}")
+        path.write_text("\n".join(lines) + "\n")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
 
 
 class DummyLLM:
@@ -31,7 +63,7 @@ class DummyLLM:
             "explanation": "Statement stub only; case split left as future work.",
         }
 
-    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
+    def check_equivalence(self, theorem: str,claim_statement: str, lean_code: str) -> dict:
         return {"relation": "equivalent", "notes": "Matches the informal claim."}
 
     def repair_formalization(
@@ -66,7 +98,7 @@ class MistranslatedThenRepairedLLM(DummyLLM):
             "explanation": "first (bad) draft",
         }
 
-    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
+    def check_equivalence(self, theorem: str, claim_statement: str, lean_code: str) -> dict:
         if not self._reviewed_once:
             self._reviewed_once = True
             return {"relation": "unrelated", "notes": "Does not mention parity at all."}
@@ -85,7 +117,7 @@ class MistranslatedThenRepairedLLM(DummyLLM):
 
 class LangGraphWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.mkdtemp(prefix="langgraph-proof-", dir="/tmp")
+        self.temp_dir = tempfile.mkdtemp(prefix="langgraph-proof-")
 
     def tearDown(self) -> None:
         result = getattr(self, "_result", None)
@@ -105,11 +137,12 @@ class LangGraphWorkflowTests(unittest.TestCase):
         self.assertIn("proof", verdict["reason"].lower())
 
     def test_module_cli_invokes_main(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
         result = subprocess.run(
             [sys.executable, "-m", "proof_proto.cli", "--help"],
             capture_output=True,
             text=True,
-            cwd="/home/tsigemariam/ben's-idea-prototype",
+            cwd=str(repo_root),
             check=False,
         )
         self.assertEqual(result.returncode, 0)
@@ -146,6 +179,10 @@ class LangGraphWorkflowTests(unittest.TestCase):
         self.assertTrue(Path(self.temp_dir, "journal.jsonl").exists())
 
     def test_formalizer_promotes_to_lean_verified_on_clean_pass(self) -> None:
+        """§11.3: a genuinely clean Lean check should promote the claim and attempt
+        to lean_verified, and close the proof state (FormalVerifier already treats
+        lean_verified as proof-closing evidence).
+        """
         self._result = run_workflow(
             theorem="For all n, n^2 + n is even",
             root=self.temp_dir,
@@ -161,6 +198,7 @@ class LangGraphWorkflowTests(unittest.TestCase):
 
         claims = project.graph.get_all_claims(project.proof_id)
         claim = next(c for c in claims if c["id"] == claim_id)
+        # §11.2's claim-to-Lean mapping fields should be populated.
         self.assertEqual(claim["lean_name"], "parity_split")
         self.assertTrue(claim["lean_statement_path"])
         self.assertIn(claim["formalization_status"], {"verified", "unavailable"})
@@ -188,6 +226,9 @@ class LangGraphWorkflowTests(unittest.TestCase):
         self.assertEqual(attempts[0]["status"], "supported")
 
     def test_formalizer_repairs_a_mistranslated_draft(self) -> None:
+        """§11.3: equivalence review catches a mistranslation before Lean is ever
+        invoked, and one repair attempt is allowed to fix it.
+        """
         self._result = run_workflow(
             theorem="For all n, n^2 + n is even",
             root=self.temp_dir,
@@ -224,13 +265,13 @@ class LeanCheckerTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
 
     def test_rejects_sorry_even_on_clean_exit(self) -> None:
-        import stat
+        """§11.3: 'production verification must reject sorry' — a fake `lean` binary
+        that exits 0 but warns about `sorry` must NOT be reported as verified.
+        """
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\necho \"warning: declaration uses 'sorry'\"\nexit 0\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir, stdout="warning: declaration uses 'sorry'")
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("theorem t : True := by sorry")
@@ -240,13 +281,10 @@ class LeanCheckerTests(unittest.TestCase):
             shutil.rmtree(fake_bin_dir)
 
     def test_rejects_untracked_axiom_even_on_clean_exit(self) -> None:
-        import stat
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\nexit 0\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir)
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("axiom foo : True\ntheorem t : True := foo")
@@ -256,13 +294,10 @@ class LeanCheckerTests(unittest.TestCase):
             shutil.rmtree(fake_bin_dir)
 
     def test_reports_verified_on_genuinely_clean_code(self) -> None:
-        import stat
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\nexit 0\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir)
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("theorem t : True := trivial")
@@ -271,13 +306,10 @@ class LeanCheckerTests(unittest.TestCase):
             shutil.rmtree(fake_bin_dir)
 
     def test_reports_failed_with_error_category_on_nonzero_exit(self) -> None:
-        import stat
         from proof_proto.langgraph_workflow import LeanChecker
 
-        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-", dir="/tmp")
-        fake_lean = Path(fake_bin_dir, "lean")
-        fake_lean.write_text("#!/bin/sh\necho 'error: unknown identifier foo' >&2\nexit 1\n")
-        fake_lean.chmod(fake_lean.stat().st_mode | stat.S_IEXEC)
+        fake_bin_dir = tempfile.mkdtemp(prefix="fake-lean-")
+        fake_lean = _write_fake_lean(fake_bin_dir, stderr="error: unknown identifier foo", exit_code=1)
         try:
             checker = LeanChecker(binary=str(fake_lean))
             result = checker.check("theorem t : True := foo")

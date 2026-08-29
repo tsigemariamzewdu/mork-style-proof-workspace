@@ -18,8 +18,6 @@ import hashlib
 import json
 import os
 import re
-from unittest import result
-from unittest import result
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -78,6 +76,22 @@ LEAN_ERROR_CATEGORIES = (
     "inconsistent_assumptions",
     "likely_mathematical_gap",
    "formal_statement_stronger_than_informal",
+   "missing_mathlib_dependency",
+   "stale_or_moved_mathlib_module"
+)
+
+MATHLIB_GUIDANCE = (
+    "\nMathlib-specific rules for this environment:\n"
+    "- Never write `import Mathlib` alone. Import the narrowest specific module\n"
+    "  you actually need (e.g. `import Mathlib.Algebra.Ring.Parity`, not the whole\n"
+    "  library) — bare `import Mathlib` takes several minutes to load.\n"
+    "- Mathlib reorganizes module paths and renames declarations frequently.\n"
+    "  If your proof fails with 'bad import' or 'unknown identifier'/'unknown\n"
+    "  constant', this is very likely a stale name or moved module, not\n"
+    "  necessarily wrong mathematics.\n"
+    "- Never declare a variable, binder, or hypothesis using the same name as a\n"
+    "  built-in type notation (ℕ, ℤ, ℝ, ℚ, etc.) — this silently shadows the real\n"
+    "  type and produces confusing, unrelated-looking errors.\n"
 )
 
 
@@ -124,6 +138,7 @@ def _formalize_prompt(theorem: str, move_summary: str, claim_statement: str, con
         f"Move summary: {move_summary}\n"
         f"Claim statement (the exact proposition to formalize): {claim_statement}\n"
         f"Context: {json.dumps(context, indent=2)[:2000]}\n"
+        f"{MATHLIB_GUIDANCE}\n"
         f"Return ONLY a JSON object with exactly these keys:\n"
         f'  "translatable" — true or false: can this claim be meaningfully stated\n'
         f"    in Lean 4 right now (even with `sorry` in the proof body)?\n"
@@ -135,13 +150,13 @@ def _formalize_prompt(theorem: str, move_summary: str, claim_statement: str, con
         f"    what was left as `sorry`"
     )
 
-
-def _equivalence_prompt(claim_statement: str, lean_code: str) -> str:
+def _equivalence_prompt(theorem: str, claim_statement: str, lean_code: str) -> str:
     return (
         f"You are reviewing a Lean 4 translation for faithfulness to an informal claim.\n"
         f"Do not judge whether the Lean code compiles — only whether, if it did compile,\n"
         f"it would say the same mathematical thing as the informal claim: same quantifiers,\n"
         f"same domain, same strength.\n"
+        f"Theorem being worked on: {theorem}\n"
         f"Informal claim: {claim_statement}\n"
         f"Lean 4 statement:\n{lean_code}\n"
         f"Return ONLY a JSON object with exactly these keys:\n"
@@ -161,6 +176,7 @@ def _repair_prompt(
         f"Rejection category: {category}\n"
         f"Diagnostic (compiler output or equivalence-review note): {diagnostic}\n"
         f"Context: {json.dumps(context, indent=2)[:1500]}\n"
+        f"{MATHLIB_GUIDANCE}\n"
         f"Either produce a corrected Lean 4 translation, or if the diagnostic reveals a\n"
         f"genuine mathematical gap (not just a translation slip), say so honestly.\n"
         f"Return ONLY a JSON object with exactly these keys:\n"
@@ -299,8 +315,10 @@ class LLMClient(ABC):
             self._respond(_formalize_prompt(theorem, move_summary, claim_statement, context))
         )
 
-    def check_equivalence(self, claim_statement: str, lean_code: str) -> dict:
-        return _normalize_equivalence(self._respond(_equivalence_prompt(claim_statement, lean_code)))
+    def check_equivalence(self, theorem: str, claim_statement: str, lean_code: str) -> dict:
+        return _normalize_equivalence(
+            self._respond(_equivalence_prompt(theorem, claim_statement, lean_code))
+        )
 
     def repair_formalization(
         self, theorem: str, claim_statement: str, lean_code: str, diagnostic: str, category: str, context: dict,
@@ -474,8 +492,16 @@ def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
     if timed_out:
         return "resource_timeout"
     text = output.lower()
+    if (
+        "unknown module prefix" in text
+        or ("no directory" in text and ".olean" in text)
+        or ("object file" in text and ".olean" in text and "does not exist" in text)
+    ):
+        return "missing_mathlib_dependency"
+    if "bad import" in text:
+        return "stale_or_moved_mathlib_module"
     if "unknown identifier" in text or "unknown constant" in text or "unknown namespace" in text:
-       return "missing_definition_or_library_lemma"
+        return "missing_definition_or_library_lemma"
     if "type mismatch" in text or "failed to synthesize" in text:
         return "elaboration_type_mismatch"
     if "unsolved goals" in text or "tactic" in text and "failed" in text:
@@ -486,13 +512,55 @@ def classify_lean_error(output: str, *, timed_out: bool = False) -> str:
 
 
 class LeanChecker:
-    
-    def __init__(self, binary: str = "lean", timeout_seconds: int = 20):
+
+    def __init__(
+        self,
+        binary: str = "lean",
+        timeout_seconds: int = 45,
+        use_lake: bool = False,
+        lake_project_dir: str = "",
+    ):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
+        self.use_lake = use_lake
+        self.lake_project_dir = lake_project_dir
+        self._toolchain_cache: str = ""
+        self._mathlib_revision_cache: str = ""
 
     def available(self) -> bool:
+        if self.use_lake:
+            return shutil.which("lake") is not None
         return shutil.which(self.binary) is not None
+
+    def _resolve_toolchain(self) -> str:
+        if not self._toolchain_cache:
+            try:
+                command = (
+                    ["lake", "env", self.binary, "--version"]
+                    if self.use_lake else [self.binary, "--version"]
+                )
+                proc = subprocess.run(
+                    command, cwd=self.lake_project_dir or None,
+                    capture_output=True, text=True, encoding="utf-8", timeout=10,
+                )
+                self._toolchain_cache = (proc.stdout or proc.stderr).strip()
+            except Exception:
+                self._toolchain_cache = ""
+        return self._toolchain_cache
+
+    def _resolve_mathlib_revision(self) -> str:
+        if not self._mathlib_revision_cache and self.lake_project_dir:
+            mathlib_dir = os.path.join(self.lake_project_dir, ".lake", "packages", "mathlib")
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", mathlib_dir, "rev-parse", "HEAD"],
+                    capture_output=True, text=True, encoding="utf-8", timeout=10,
+                )
+                if proc.returncode == 0:
+                    self._mathlib_revision_cache = proc.stdout.strip()
+            except Exception:
+                pass
+        return self._mathlib_revision_cache
 
     def check(
         self,
@@ -505,9 +573,17 @@ class LeanChecker:
         deny_sorry: bool = True,
     ) -> dict:
         """
-        Returns a dict with: status, output (diagnostics), axioms_used, timing_seconds,
-        source_hash, error_category (only set on a genuine compiler failure).
+        Returns a dict with: status, output (diagnostics), imports_used,
+        axioms_used, timing_seconds, source_hash, error_category (only set
+        on a genuine compiler failure). 
         """
+        toolchain = toolchain or self._resolve_toolchain()
+        mathlib_revision = mathlib_revision or (
+            self._resolve_mathlib_revision() if self.use_lake else ""
+        )
+
+        imports_used = re.findall(r"^\s*import\s+(\S+)", lean_code, re.MULTILINE)
+
         source_hash = hashlib.sha256(lean_code.encode("utf-8")).hexdigest()[:16]
         base_result = {
             "proof_id": proof_id,
@@ -515,10 +591,12 @@ class LeanChecker:
             "toolchain": toolchain,
             "mathlib_revision": mathlib_revision,
             "source_hash": source_hash,
+            "imports_used": imports_used,
             "axioms_used": [],
             "timing_seconds": 0.0,
             "error_category": "",
         }
+        # ... everything else in the method body stays exactly as it is today
         if not lean_code or not lean_code.strip():
             return {**base_result, "status": "unavailable", "output": "No Lean code to check."}
         if not self.available():
@@ -531,14 +609,19 @@ class LeanChecker:
         declared_axioms = re.findall(r"\baxiom\s+([A-Za-z_][A-Za-z0-9_']*)", lean_code)
         uses_sorry = bool(re.search(r"\bsorry\b", lean_code))
 
-        handle = tempfile.NamedTemporaryFile(suffix=".lean", mode="w", delete=False)
+        handle = tempfile.NamedTemporaryFile(suffix=".lean", mode="w", delete=False, encoding="utf-8")
         started = time.monotonic()
         try:
             handle.write(lean_code)
             handle.close()
+
+            command = (
+                ["lake", "env", self.binary, handle.name]
+                if self.use_lake else [self.binary, handle.name]
+            )
             proc = subprocess.run(
-                [self.binary, handle.name],
-                capture_output=True, text=True, timeout=self.timeout_seconds,
+                command, cwd=self.lake_project_dir or None,
+                capture_output=True, text=True, encoding="utf-8", timeout=self.timeout_seconds,
             )
             elapsed = time.monotonic() - started
             output = proc.stdout + proc.stderr
@@ -567,12 +650,7 @@ class LeanChecker:
                     "timing_seconds": elapsed,
                     "axioms_used": declared_axioms,
                 }
-            return {
-                **base_result,
-                "status": "verified",
-                "output": output,
-                "timing_seconds": elapsed,
-            }
+            return {**base_result, "status": "verified", "output": output, "timing_seconds": elapsed}
         except subprocess.TimeoutExpired:
             return {
                 **base_result,
@@ -581,14 +659,13 @@ class LeanChecker:
                 "timing_seconds": self.timeout_seconds,
                 "error_category": classify_lean_error("", timed_out=True),
             }
-        except OSError as exc:  # pragma: no cover - defensive
+        except OSError as exc:
             return {**base_result, "status": "unavailable", "output": f"Lean check errored: {exc}"}
         finally:
             try:
                 os.unlink(handle.name)
             except OSError:
                 pass
-
 
 # ---------------------------------------------------------------------------
 # LangGraph workflow
@@ -731,8 +808,9 @@ class ProofWorkflow:
         lean_name = draft["lean_name"] or _lean_identifier(claim_id)
         namespace = f"Proof_{_lean_identifier(project.proof_id)}"
 
-        # as the informal claim, before we ever bother invoking Lean? -----------
-        review = self.llm.check_equivalence(claim_statement, lean_code)
+    
+        # claim, before we ever bother invoking Lean.
+        review = self.llm.check_equivalence(theorem, claim_statement, lean_code)
         relation_to_category = {
             "stronger": "formal_statement_stronger_than_informal",
             "weaker": "translation_ambiguity",
@@ -750,17 +828,14 @@ class ProofWorkflow:
             if repair["translatable"] and repair["lean_code"]:
                 lean_code = repair["lean_code"]
                 lean_name = repair["lean_name"] or lean_name
-                review = self.llm.check_equivalence(claim_statement, lean_code)
+                review = self.llm.check_equivalence(theorem, claim_statement, lean_code)
                 equivalence_category = relation_to_category.get(review["relation"], "")
             else:
-                # Repair agent judged this a genuine mathematical gap, not a
-                # fixable translation slip — expose it rather than keep trying.
                 equivalence_category = "likely_mathematical_gap"
 
         final_status = equivalence_category or "pending"
         check: dict = {}
         if not equivalence_category:
-            # built into LeanChecker itself 
             check = self.lean_checker.check(
                 lean_code, proof_id=project.proof_id, claim_id=claim_id,
                 toolchain=self.toolchain, mathlib_revision=self.mathlib_revision,
@@ -783,7 +858,6 @@ class ProofWorkflow:
                     )
                     final_status = check.get("status", "unavailable")
 
-        # --- commit source + log as artifacts 
         source_artifact = project.write_artifact(
             name=f"{attempt_id}-lean", content=lean_code, kind="lean_snippet", attempt_id=attempt_id,
         )
@@ -793,26 +867,26 @@ class ProofWorkflow:
                 kind="lean_check_log", attempt_id=attempt_id,
             )
 
-        # --- write the claim + its Lean metadata 
+        resolved_toolchain = check.get("toolchain") or self.toolchain
+        resolved_mathlib_revision = check.get("mathlib_revision") or self.mathlib_revision
+
         project.add_claim(claim_id, claim_statement)
         project.link_produced_claim(attempt_id, claim_id)
         project.record_lean_formalization(
             claim_id, lean_name=lean_name, lean_statement_path=source_artifact["path"],
-            namespace=namespace, toolchain_hash=self.toolchain,
-            mathlib_revision=self.mathlib_revision, formalization_status=final_status,
+            namespace=namespace, toolchain_hash=resolved_toolchain,
+            mathlib_revision=resolved_mathlib_revision, formalization_status=final_status,
             last_compiler_output=check.get("output", review.get("notes", "")),
         )
 
-        # --- record the verification 
         project.add_verification(
             attempt_id, claim_id, kind="lean", status=final_status, lean_name=lean_name,
-            toolchain_hash=self.toolchain, mathlib_revision=self.mathlib_revision,
+            toolchain_hash=resolved_toolchain, mathlib_revision=resolved_mathlib_revision,
             error_category=check.get("error_category", equivalence_category),
             axioms_used=check.get("axioms_used", []), timing_seconds=check.get("timing_seconds", 0.0),
             source_hash=check.get("source_hash", ""),
         )
 
-        # --- promote only on a genuine, clean pass 
         if final_status == "verified":
             project.update_claim_status(
                 claim_id, "lean_verified",
@@ -824,6 +898,7 @@ class ProofWorkflow:
 
         state["last_lean_status"] = final_status
         return self._maybe_close(state)
+
 
     def _maybe_close(self, state: WorkflowState) -> WorkflowState:
         """Run the formal verifier now that the critic's verdict and any Lean check
@@ -838,7 +913,7 @@ class ProofWorkflow:
             project.close_state(ROOT_STATE_ID, verdict["reason"] or state.get("last_critique", ""))
             state["proof_closed"] = True
         return state
-
+    
     # --- routing ----------------------------------------------------------
 
     @staticmethod
@@ -871,9 +946,11 @@ def run_workflow(
     max_iterations: int = DEFAULT_ITERATIONS,
     toolchain: str = "",
     mathlib_revision: str = "",
+    lean_checker: Optional[LeanChecker] = None
 ) -> Dict[str, Any]:
     """Run the LangGraph explore/critique/formalize workflow over the proof workspace."""
-    graph = build_graph(llm_client or make_llm_client(), toolchain=toolchain, mathlib_revision=mathlib_revision)
+    graph = build_graph(llm_client or make_llm_client(), toolchain=toolchain, 
+                        mathlib_revision=mathlib_revision,lean_checker=lean_checker)
     project = ProofProject(root, theorem)
     if project.graph.get_state(ROOT_STATE_ID, project.proof_id) is None:
         project.add_state(ROOT_STATE_ID, "Initial theorem state")
